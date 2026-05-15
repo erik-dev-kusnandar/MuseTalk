@@ -1,0 +1,8 @@
+avator_1:
+ preparation: False # True # your can set it to False if you want to use the existing avator, it will save time
+ bbox_shift: 12
+ video_path: "data/video/alish.mp4"
+ audio_path: "data/audio/alish-audio.wav"
+ 
+  
+

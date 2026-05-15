@@ -4,6 +4,7 @@
 # Usage:
 # To run v1.0 inference: sh inference.sh v1.0 [normal|realtime]
 # To run v1.5 inference: sh inference.sh v1.5 [normal|realtime]
+# To run v1.5 inference: sh inference.sh v1.5 [normal|realtime][ai-seminar]
 
 # Check if the correct number of arguments is provided
 if [ "$#" -ne 2 ]; then
@@ -17,7 +18,7 @@ version=$1
 mode=$2
 
 # Validate mode
-if [ "$mode" != "normal" ] && [ "$mode" != "realtime" ]; then
+if [ "$mode" != "normal" ] && [ "$mode" != "realtime" ] && [ "$mode" != "ai-seminar" ]; then
     echo "Invalid mode specified. Please use 'normal' or 'realtime'."
     exit 1
 fi
@@ -26,6 +27,9 @@ fi
 if [ "$mode" = "normal" ]; then
     config_path="./configs/inference/test.yaml"
     result_dir="./results/test"
+elif [ "$mode" = "ai-seminar" ]; then
+    config_path="./configs/inference/ai-seminar.yaml"
+    result_dir="./results/ai-seminar"
 else
     config_path="./configs/inference/realtime.yaml"
     result_dir="./results/realtime"
@@ -49,6 +53,8 @@ fi
 
 # Set script name based on mode
 if [ "$mode" = "normal" ]; then
+    script_name="scripts.inference"
+elif [ "$mode" = "ai-seminar" ]; then
     script_name="scripts.inference"
 else
     script_name="scripts.realtime_inference"

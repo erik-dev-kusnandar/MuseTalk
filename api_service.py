@@ -1,0 +1,334 @@
+"""
+MuseTalk FastAPI Service - AI Seminar Integration
+Berjalan di port 8002 dengan musetalk_env venv.
+Endpoint: POST /generate-video → return video MP4
+"""
+
+import os
+import sys
+import time
+import uuid
+import shutil
+import queue
+import threading
+import argparse
+import tempfile
+import logging
+from pathlib import Path
+from typing import Optional
+
+import torch
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+# MuseTalk imports (harus run dari folder /home/ubuntu/MuseTalk)
+from omegaconf import OmegaConf
+from musetalk.utils.face_parsing import FaceParsing
+from musetalk.utils.utils import datagen
+from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs
+from musetalk.utils.blending import get_image_prepare_material, get_image_blending
+from musetalk.utils.utils import load_all_model
+from musetalk.utils.audio_processor import AudioProcessor
+from transformers import WhisperModel
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ─── Konfigurasi ───────────────────────────────────────────────
+MUSETALK_DIR   = Path(__file__).parent.resolve()
+AVATAR_ID      = os.getenv("MUSETALK_AVATAR_ID", "avator_1")
+AVATAR_VERSION = "v15"
+MODEL_UNET     = str(MUSETALK_DIR / "models/musetalkV15/unet.pth")
+MODEL_CONFIG   = str(MUSETALK_DIR / "models/musetalkV15/musetalk.json")
+WHISPER_DIR    = str(MUSETALK_DIR / "models/whisper")
+VIDEO_OUT_DIR  = MUSETALK_DIR / f"results/{AVATAR_VERSION}/avatars/{AVATAR_ID}/vid_output"
+AVATAR_PATH    = MUSETALK_DIR / f"results/{AVATAR_VERSION}/avatars/{AVATAR_ID}"
+VIDEO_PATH     = str(MUSETALK_DIR / "data/video/yongen.mp4")  # avatar reference video
+
+VIDEO_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─── App ───────────────────────────────────────────────────────
+app = FastAPI(title="MuseTalk API Service")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── Global model state ────────────────────────────────────────
+device       = None
+vae          = None
+unet         = None
+pe           = None
+whisper      = None
+audio_proc   = None
+fp           = None
+timesteps    = None
+weight_dtype = None
+avatar_obj   = None
+
+# ─── Avatar class (disederhanakan dari realtime_inference.py) ──
+class Avatar:
+    def __init__(self, avatar_id: str, batch_size: int = 20):
+        self.avatar_id   = avatar_id
+        self.base_path   = str(AVATAR_PATH)
+        self.full_imgs_path    = f"{self.base_path}/full_imgs"
+        self.coords_path       = f"{self.base_path}/coords.pkl"
+        self.latents_out_path  = f"{self.base_path}/latents.pt"
+        self.video_out_path    = f"{self.base_path}/vid_output/"
+        self.mask_out_path     = f"{self.base_path}/mask"
+        self.mask_coords_path  = f"{self.base_path}/mask_coords.pkl"
+        self.batch_size        = batch_size
+        self.idx = 0
+        self._load_prepared()
+
+    def _load_prepared(self):
+        """Load avatar yang sudah ter-prepare (preparation: False)"""
+        import pickle, cv2, glob
+        logger.info(f"Loading prepared avatar: {self.avatar_id}")
+
+        self.input_latent_list_cycle = torch.load(self.latents_out_path)
+        with open(self.coords_path, 'rb') as f:
+            self.coord_list_cycle = pickle.load(f)
+
+        input_img_list = sorted(glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]')))
+        self.frame_list_cycle = read_imgs(input_img_list)
+
+        with open(self.mask_coords_path, 'rb') as f:
+            self.mask_coords_list_cycle = pickle.load(f)
+
+        input_mask_list = sorted(glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]')))
+        self.mask_list_cycle = read_imgs(input_mask_list)
+        logger.info(f"Avatar loaded: {len(self.frame_list_cycle)} frames")
+
+    def process_frames(self, res_frame_queue, video_num, skip_save_images, tmp_path):
+        import cv2
+        while True:
+            if res_frame_queue.empty():
+                if self.idx >= video_num:
+                    break
+                time.sleep(0.02)
+                continue
+            res_frame = res_frame_queue.get(block=False)
+            bbox     = self.coord_list_cycle[self.idx % len(self.coord_list_cycle)]
+            x1, y1, x2, y2 = bbox
+            try:
+                res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+            except:
+                self.idx += 1
+                continue
+                
+            ori_frame = self.frame_list_cycle[self.idx % len(self.frame_list_cycle)].copy()
+            mask      = self.mask_list_cycle[self.idx % len(self.mask_list_cycle)]
+            mask_crop = self.mask_coords_list_cycle[self.idx % len(self.mask_coords_list_cycle)]
+            combine   = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop)
+            if not skip_save_images:
+                cv2.imwrite(f"{tmp_path}/{str(self.idx).zfill(8)}.png", combine)
+            self.idx += 1
+
+    @torch.no_grad()
+    def inference(self, audio_path: str, out_vid_name: str, fps: int = 25) -> str:
+        tmp_path = f"{self.base_path}/tmp_{uuid.uuid4().hex}"
+        os.makedirs(tmp_path, exist_ok=True)
+        self.idx = 0
+
+        # Audio features
+        whisper_input_features, librosa_length = audio_proc.get_audio_feature(
+            audio_path, weight_dtype=weight_dtype
+        )
+        whisper_chunks = audio_proc.get_whisper_chunk(
+            whisper_input_features, device, weight_dtype, whisper,
+            librosa_length, fps=fps,
+            audio_padding_length_left=2,
+            audio_padding_length_right=2,
+        )
+
+        video_num = len(whisper_chunks)
+        res_frame_queue = queue.Queue()
+        process_thread = threading.Thread(
+            target=self.process_frames,
+            args=(res_frame_queue, video_num, False, tmp_path)
+        )
+        process_thread.start()
+
+        gen = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
+        for whisper_batch, latent_batch in gen:
+            audio_feat = pe(whisper_batch.to(device))
+            latent_batch = latent_batch.to(device=device, dtype=unet.model.dtype)
+            pred = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feat).sample
+            pred = pred.to(device=device, dtype=vae.vae.dtype)
+            recon = vae.decode_latents(pred)
+            for frame in recon:
+                res_frame_queue.put(frame)
+
+        process_thread.join()
+
+        # Encode ke video
+        temp_mp4 = f"{self.base_path}/temp_{uuid.uuid4().hex}.mp4"
+        os.system(
+            f"ffmpeg -y -v warning -r {fps} -f image2 "
+            f"-i {tmp_path}/%08d.png -vcodec libx264 "
+            f"-vf format=yuv420p -crf 18 {temp_mp4}"
+        )
+
+        output_vid = os.path.join(self.video_out_path, f"{out_vid_name}.mp4")
+        os.system(
+            f"ffmpeg -y -v warning -i {audio_path} "
+            f"-i {temp_mp4} {output_vid}"
+        )
+
+        # Cleanup
+        if os.path.exists(temp_mp4):
+            os.remove(temp_mp4)
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+        logger.info(f"Video saved: {output_vid}")
+        return output_vid
+
+
+# ─── Startup: load models ──────────────────────────────────────
+@app.on_event("startup")
+async def startup_event():
+    global device, vae, unet, pe, whisper, audio_proc, fp, timesteps, weight_dtype, avatar_obj
+
+    logger.info("Loading MuseTalk models...")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    vae, unet, pe = load_all_model(
+        unet_model_path=MODEL_UNET,
+        vae_type="sd-vae",
+        unet_config=MODEL_CONFIG,
+        device=device,
+    )
+    timesteps = torch.tensor([0], device=device)
+
+    pe       = pe.half().to(device)
+    vae.vae  = vae.vae.half().to(device)
+    unet.model = unet.model.half().to(device)
+
+    weight_dtype = unet.model.dtype
+
+    audio_proc = AudioProcessor(feature_extractor_path=WHISPER_DIR)
+    whisper = WhisperModel.from_pretrained(WHISPER_DIR)
+    whisper = whisper.to(device=device, dtype=weight_dtype).eval()
+    whisper.requires_grad_(False)
+
+    fp = FaceParsing(left_cheek_width=90, right_cheek_width=90)
+
+    logger.info("Loading prepared avatar...")
+    avatar_obj = Avatar(avatar_id=AVATAR_ID, batch_size=20)
+    logger.info("MuseTalk API ready! ✅")
+
+
+# ─── Endpoints ────────────────────────────────────────────────
+@app.post("/prepare-avatar")
+async def prepare_avatar(file: UploadFile = File(...)):
+    """Uploads a new photo/video, prepares it, and switches context"""
+    import subprocess
+    import yaml
+    
+    avatar_id = f"avatar_{uuid.uuid4().hex[:8]}"
+    file_ext = Path(file.filename).suffix.lower()
+    
+    tmp_upload = tempfile.mktemp(suffix=file_ext)
+    with open(tmp_upload, "wb") as f:
+        f.write(await file.read())
+        
+    try:
+        # Convert image to video if needed
+        video_path = str(MUSETALK_DIR / f"data/video/{avatar_id}.mp4")
+        if file_ext in [".jpg", ".jpeg", ".png"]:
+            logger.info("Converting image to short video for prep...")
+            # Create a 2s 25fps video from image
+            cmd = f"ffmpeg -y -loop 1 -i {tmp_upload} -c:v libx264 -t 2 -pix_fmt yuv420p -r 25 {video_path}"
+            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            shutil.copy(tmp_upload, video_path)
+            
+        # Create prep YAML
+        config_yaml_path = tempfile.mktemp(suffix=".yaml")
+        config_data = {
+            avatar_id: {
+                "preparation": True,
+                "bbox_shift": 5,
+                "video_path": f"data/video/{avatar_id}.mp4",
+                "audio_clips": {}
+            }
+        }
+        with open(config_yaml_path, "w") as f:
+            yaml.dump(config_data, f)
+            
+        # Run preparation script
+        logger.info(f"Running MuseTalk preparation for {avatar_id}...")
+        env = os.environ.copy()
+        subprocess.run(
+            f"{sys.executable} -m scripts.realtime_inference --inference_config {config_yaml_path}",
+            shell=True,
+            cwd=str(MUSETALK_DIR),
+            env=env,
+            check=True
+        )
+        
+        # Reload avatar_obj
+        global AVATAR_ID, avatar_obj
+        AVATAR_ID = avatar_id
+        logger.info("Loading newly prepared avatar...")
+        avatar_obj = Avatar(avatar_id=AVATAR_ID, batch_size=20)
+        
+        return {"status": "success", "avatar_id": avatar_id}
+    except Exception as e:
+        logger.error(f"Preparation failed: {e}")
+        raise HTTPException(500, str(e))
+    finally:
+        if os.path.exists(tmp_upload):
+            os.remove(tmp_upload)
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ready" if avatar_obj else "loading",
+        "device": str(device),
+        "avatar": AVATAR_ID,
+    }
+
+
+@app.post("/generate-video")
+async def generate_video(audio_file: UploadFile = File(...)):
+    """Terima audio WAV, return video MP4 talking head"""
+    if avatar_obj is None:
+        raise HTTPException(503, "Model masih loading, coba lagi sebentar")
+
+    # Simpan audio sementara
+    suffix = Path(audio_file.filename).suffix or ".wav"
+    tmp_audio = tempfile.mktemp(suffix=suffix)
+    with open(tmp_audio, "wb") as f:
+        f.write(await audio_file.read())
+
+    try:
+        out_name = f"ai_{uuid.uuid4().hex[:8]}"
+        t0 = time.time()
+        output_path = avatar_obj.inference(tmp_audio, out_name, fps=25)
+        logger.info(f"Video generated in {time.time()-t0:.1f}s → {output_path}")
+
+        if not os.path.exists(output_path):
+            raise HTTPException(500, "Video generation failed")
+
+        return FileResponse(
+            output_path,
+            media_type="video/mp4",
+            filename=f"{out_name}.mp4"
+        )
+    finally:
+        if os.path.exists(tmp_audio):
+            os.remove(tmp_audio)
+
+
+if __name__ == "__main__":
+    os.chdir(MUSETALK_DIR)  # Wajib! MuseTalk butuh CWD di folder-nya
+    uvicorn.run(app, host="0.0.0.0", port=8002, log_level="info")
