@@ -8,7 +8,8 @@ def get_crop_box(box, expand):
     x, y, x1, y1 = box
     x_c, y_c = (x+x1)//2, (y+y1)//2
     w, h = x1-x, y1-y
-    s = int(max(w, h)//2*expand)
+    s = int(max(w, h, 2)//2*expand) # Ensure at least 2 pixels before expand
+    if s < 1: s = 1
     crop_box = [x_c-s, y_c-s, x_c+s, y_c+s]
     return crop_box, s
 
@@ -28,7 +29,13 @@ def face_seg(image, mode="raw", fp=None):
         print("error, no person_segment")  # 如果没有检测到面部，返回错误
         return None
 
-    seg_image = seg_image.resize(image.size)  # 将掩码图像调整为输入图像的大小
+    # Safety check for image size
+    w, h = image.size
+    if w <= 0 or h <= 0:
+        print(f"error, invalid image size: {w}x{h}")
+        return None
+
+    seg_image = seg_image.resize((w, h))  # 将掩码图像调整为输入图像的大小
     return seg_image
 
 
@@ -57,24 +64,24 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
     face_position = (x, y)  # 面部在原始图像中的位置
 
     # 从身体图像中裁剪出扩展后的面部区域（下巴到边界有距离）
-    face_large = body.crop(crop_box)
+    face_large = body.crop((int(x_s), int(y_s), int(x_e), int(y_e)))
         
     ori_shape = face_large.size  # 裁剪后图像的原始尺寸
 
     # 对裁剪后的面部区域进行面部解析，生成掩码
     mask_image = face_seg(face_large, mode=mode, fp=fp)
     
-    mask_small = mask_image.crop((x - x_s, y - y_s, x1 - x_s, y1 - y_s))  # 裁剪出面部区域的掩码
+    mask_small = mask_image.crop((int(x - x_s), int(y - y_s), int(x1 - x_s), int(y1 - y_s)))  # 裁剪出面部区域的掩码
     
     mask_image = Image.new('L', ori_shape, 0)  # 创建一个全黑的掩码图像
-    mask_image.paste(mask_small, (x - x_s, y - y_s, x1 - x_s, y1 - y_s))  # 将面部掩码粘贴到全黑图像上
+    mask_image.paste(mask_small, (int(x - x_s), int(y - y_s), int(x1 - x_s), int(y1 - y_s)))  # 将面部掩码粘贴到全黑图像上
     
     
     # 保留面部区域的上半部分（用于控制说话区域）
     width, height = mask_image.size
     top_boundary = int(height * upper_boundary_ratio)  # 计算上半部分的边界
     modified_mask_image = Image.new('L', ori_shape, 0)  # 创建一个新的全黑掩码图像
-    modified_mask_image.paste(mask_image.crop((0, top_boundary, width, height)), (0, top_boundary))  # 粘贴上半部分掩码
+    modified_mask_image.paste(mask_image.crop((0, int(top_boundary), int(width), int(height))), (0, int(top_boundary)))  # 粘贴上半部分掩码
     
     
     # 对掩码进行高斯模糊，使边缘更平滑
@@ -84,9 +91,9 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
     mask_image = Image.fromarray(mask_array)  # 将模糊后的掩码转换回 PIL 图像
     
     # 将裁剪的面部图像粘贴回扩展后的面部区域
-    face_large.paste(face, (x - x_s, y - y_s, x1 - x_s, y1 - y_s))
+    face_large.paste(face, (int(x - x_s), int(y - y_s), int(x1 - x_s), int(y1 - y_s)))
     
-    body.paste(face_large, crop_box[:2], mask_image)
+    body.paste(face_large, (int(crop_box[0]), int(crop_box[1])), mask_image)
     
     body = np.array(body)  # 将 PIL 图像转换回 numpy 数组
 
@@ -103,8 +110,8 @@ def get_image_blending(image, face, face_box, mask_array, crop_box):
 
     mask_image = Image.fromarray(mask_array)
     mask_image = mask_image.convert("L")
-    face_large.paste(face, (x-x_s, y-y_s, x1-x_s, y1-y_s))
-    body.paste(face_large, crop_box[:2], mask_image)
+    face_large.paste(face, (int(x-x_s), int(y-y_s), int(x1-x_s), int(y1-y_s)))
+    body.paste(face_large, (int(crop_box[0]), int(crop_box[1])), mask_image)
     body = np.array(body)
     return body[:,:,::-1]
 
@@ -121,15 +128,17 @@ def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand
     ori_shape = face_large.size
 
     mask_image = face_seg(face_large, mode=mode, fp=fp)
-    mask_small = mask_image.crop((x-x_s, y-y_s, x1-x_s, y1-y_s))
+    mask_small = mask_image.crop((int(x-x_s), int(y-y_s), int(x1-x_s), int(y1-y_s)))
     mask_image = Image.new('L', ori_shape, 0)
-    mask_image.paste(mask_small, (x-x_s, y-y_s, x1-x_s, y1-y_s))
+    # mask_image.paste(mask_small, (x-x_s, y-y_s, x1-x_s, y1-y_s))
+    mask_image.paste(mask_small, (int(x-x_s), int(y-y_s), int(x1-x_s), int(y1-y_s)))
+
 
     # keep upper_boundary_ratio of talking area
     width, height = mask_image.size
     top_boundary = int(height * upper_boundary_ratio)
     modified_mask_image = Image.new('L', ori_shape, 0)
-    modified_mask_image.paste(mask_image.crop((0, top_boundary, width, height)), (0, top_boundary))
+    modified_mask_image.paste(mask_image.crop((0, int(top_boundary), int(width), int(height))), (0, int(top_boundary)))
 
     blur_kernel_size = int(0.1 * ori_shape[0] // 2 * 2) + 1
     mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)

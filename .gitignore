@@ -16,3 +16,9 @@ ffplay*
 debug
 exp_out
 .gradio
+
+# Python virtual environment
+musetalk_env/
+venv/
+env/
+.venv/

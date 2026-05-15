@@ -399,7 +399,7 @@ vae, unet, pe = load_all_model(
 # Parse command line arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("--ffmpeg_path", type=str, default=r"ffmpeg-master-latest-win64-gpl-shared\bin", help="Path to ffmpeg executable")
-parser.add_argument("--ip", type=str, default="127.0.0.1", help="IP address to bind to")
+parser.add_argument("--ip", type=str, default="0.0.0.0", help="IP address to bind to")
 parser.add_argument("--port", type=int, default=7860, help="Port to bind to")
 parser.add_argument("--share", action="store_true", help="Create a public link")
 parser.add_argument("--use_float16", action="store_true", help="Use float16 for faster inference")
