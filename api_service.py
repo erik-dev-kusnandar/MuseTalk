@@ -351,4 +351,4 @@ async def generate_video(audio_file: UploadFile = File(...), avatar_id: Optional
 
 if __name__ == "__main__":
     os.chdir(MUSETALK_DIR)  # Wajib! MuseTalk butuh CWD di folder-nya
-    uvicorn.run(app, host="[IP_ADDRESS]", port=8000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8002, log_level="info")

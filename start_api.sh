@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Navigasi ke folder MuseTalk
-cd /home/ubuntu/MuseTalk
+cd /home/ubuntu/OmniCastPro/MuseTalk
 
 # Aktifkan virtual environment
 if [ -f "musetalk_env/bin/activate" ]; then
