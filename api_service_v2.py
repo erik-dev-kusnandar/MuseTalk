@@ -247,7 +247,7 @@ async def startup_event():
     logger.info(f"Pre-loading default avatar: {AVATAR_ID}")
     try:
         # OPTIMASI: Default batch size 24
-        avatar_cache[AVATAR_ID] = Avatar(avatar_id=AVATAR_ID, batch_size=24)
+        avatar_cache[AVATAR_ID] = Avatar(avatar_id=AVATAR_ID, batch_size=8)
     except Exception as e:
         logger.warning(f"Could not load default avatar {AVATAR_ID}: {e}")
         
@@ -292,7 +292,7 @@ async def prepare_avatar(file: UploadFile = File(...)):
             shell=True, cwd=str(MUSETALK_DIR), env=env, check=True
         )
         
-        avatar_cache[avatar_id] = Avatar(avatar_id=avatar_id, batch_size=24)
+        avatar_cache[avatar_id] = Avatar(avatar_id=avatar_id, batch_size=8)
         
         return {"status": "success", "avatar_id": avatar_id}
     except Exception as e:
@@ -314,7 +314,7 @@ async def generate_video(audio_file: UploadFile = File(...), avatar_id: Optional
     
     if target_id not in avatar_cache:
         try:
-            avatar_cache[target_id] = Avatar(avatar_id=target_id, batch_size=24)
+            avatar_cache[target_id] = Avatar(avatar_id=target_id, batch_size=8)
         except Exception as e:
             raise HTTPException(404, f"Avatar not found: {e}")
 
