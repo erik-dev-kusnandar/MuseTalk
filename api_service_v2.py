@@ -253,19 +253,97 @@ async def startup_event():
         
     logger.info("MuseTalk API V2 ready! ✅")
 
+# ─── Avatar preparation (in-process) ──────────────────────────
+prep_lock = threading.Lock()
+
+
+def _prepare_avatar_material(video_path: str, avatar_id: str) -> None:
+    """In-process port of realtime_inference.Avatar.prepare_material (v15).
+
+    Reuses models already loaded in this process (vae, fp, dwpose/face-detect
+    via musetalk.utils.preprocessing) instead of spawning a subprocess that
+    duplicates every model and blows up VRAM.
+    """
+    import glob as glob_mod
+    import pickle
+
+    base_path = str(MUSETALK_DIR / f"results/{AVATAR_VERSION}/avatars/{avatar_id}")
+    full_imgs_path = f"{base_path}/full_imgs"
+    mask_out_path = f"{base_path}/mask"
+    coords_path = f"{base_path}/coords.pkl"
+    latents_out_path = f"{base_path}/latents.pt"
+    mask_coords_path = f"{base_path}/mask_coords.pkl"
+
+    if os.path.exists(base_path):
+        shutil.rmtree(base_path)
+    os.makedirs(full_imgs_path, exist_ok=True)
+    os.makedirs(mask_out_path, exist_ok=True)
+
+    logger.info(f"[{avatar_id}] extracting video frames...")
+    cap = cv2.VideoCapture(video_path)
+    count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        cv2.imwrite(f"{full_imgs_path}/{count:08d}.png", frame)
+        count += 1
+    cap.release()
+
+    input_img_list = sorted(glob_mod.glob(os.path.join(full_imgs_path, "*.[jpJP][pnPN]*[gG]")))
+    if not input_img_list:
+        raise RuntimeError("No frames could be extracted from the reference video")
+
+    logger.info(f"[{avatar_id}] extracting landmarks from {len(input_img_list)} frames...")
+    coord_list, frame_list = get_landmark_and_bbox(input_img_list, 0)
+
+    input_latent_list = []
+    coord_placeholder = (0.0, 0.0, 0.0, 0.0)
+    extra_margin = 10
+    for idx, (bbox, frame) in enumerate(zip(coord_list, frame_list)):
+        if bbox == coord_placeholder:
+            continue
+        x1, y1, x2, y2 = bbox
+        y2 = min(y2 + extra_margin, frame.shape[0])
+        coord_list[idx] = [x1, y1, x2, y2]
+        crop_frame = frame[y1:y2, x1:x2]
+        resized_crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+        input_latent_list.append(vae.get_latents_for_unet(resized_crop_frame))
+
+    if not input_latent_list:
+        raise RuntimeError("No face detected in the reference video")
+
+    frame_list_cycle = frame_list + frame_list[::-1]
+    coord_list_cycle = coord_list + coord_list[::-1]
+    latent_list_cycle = input_latent_list + input_latent_list[::-1]
+
+    logger.info(f"[{avatar_id}] building face masks ({len(frame_list_cycle)} frames)...")
+    mask_coords_list_cycle = []
+    for i, frame in enumerate(frame_list_cycle):
+        cv2.imwrite(f"{full_imgs_path}/{str(i).zfill(8)}.png", frame)
+        x1, y1, x2, y2 = coord_list_cycle[i]
+        mask, crop_box = get_image_prepare_material(frame, [x1, y1, x2, y2], fp=fp, mode="jaw")
+        cv2.imwrite(f"{mask_out_path}/{str(i).zfill(8)}.png", mask)
+        mask_coords_list_cycle.append(crop_box)
+
+    with open(mask_coords_path, "wb") as fobj:
+        pickle.dump(mask_coords_list_cycle, fobj)
+    with open(coords_path, "wb") as fobj:
+        pickle.dump(coord_list_cycle, fobj)
+    torch.save(latent_list_cycle, latents_out_path)
+    logger.info(f"[{avatar_id}] avatar material ready")
+
+
 # ─── Endpoints ────────────────────────────────────────────────
-# (Endpoint prepare-avatar tetap sama seperti sebelumnya)
 @app.post("/prepare-avatar")
 async def prepare_avatar(file: UploadFile = File(...)):
-    import yaml
-    
     avatar_id = f"avatar_{uuid.uuid4().hex[:8]}"
     file_ext = Path(file.filename).suffix.lower()
-    
+
     tmp_upload = tempfile.mktemp(suffix=file_ext)
     with open(tmp_upload, "wb") as f:
         f.write(await file.read())
-        
+
     try:
         video_path = str(MUSETALK_DIR / f"data/video/{avatar_id}.mp4")
         if file_ext in [".jpg", ".jpeg", ".png"]:
@@ -273,27 +351,11 @@ async def prepare_avatar(file: UploadFile = File(...)):
             subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             shutil.copy(tmp_upload, video_path)
-            
-        config_yaml_path = tempfile.mktemp(suffix=".yaml")
-        config_data = {
-            avatar_id: {
-                "preparation": True,
-                "bbox_shift": 0,
-                "video_path": f"data/video/{avatar_id}.mp4",
-                "audio_clips": {}
-            }
-        }
-        with open(config_yaml_path, "w") as f:
-            yaml.dump(config_data, f)
-            
-        env = os.environ.copy()
-        subprocess.run(
-            f"{sys.executable} -m scripts.realtime_inference --inference_config {config_yaml_path}",
-            shell=True, cwd=str(MUSETALK_DIR), env=env, check=True
-        )
-        
-        avatar_cache[avatar_id] = Avatar(avatar_id=avatar_id, batch_size=8)
-        
+
+        async with prep_lock:
+            await asyncio.to_thread(_prepare_avatar_material, video_path, avatar_id)
+            avatar_cache[avatar_id] = Avatar(avatar_id=avatar_id, batch_size=8)
+
         return {"status": "success", "avatar_id": avatar_id}
     except Exception as e:
         raise HTTPException(500, str(e))
