@@ -301,7 +301,7 @@ def _prepare_avatar_material(video_path: str, avatar_id: str) -> None:
     coord_placeholder = (0.0, 0.0, 0.0, 0.0)
     extra_margin = 10
     for idx, (bbox, frame) in enumerate(zip(coord_list, frame_list)):
-        if bbox == coord_placeholder:
+        if tuple(bbox) == coord_placeholder:
             continue
         x1, y1, x2, y2 = bbox
         y2 = min(y2 + extra_margin, frame.shape[0])
@@ -358,6 +358,7 @@ async def prepare_avatar(file: UploadFile = File(...)):
 
         return {"status": "success", "avatar_id": avatar_id}
     except Exception as e:
+        logger.exception(f"[{avatar_id}] prepare-avatar failed")
         raise HTTPException(500, str(e))
     finally:
         if os.path.exists(tmp_upload):
