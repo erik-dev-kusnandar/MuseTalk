@@ -10,6 +10,7 @@ import time
 import uuid
 import shutil
 import queue
+import asyncio
 import threading
 import argparse
 import tempfile
@@ -254,7 +255,7 @@ async def startup_event():
     logger.info("MuseTalk API V2 ready! ✅")
 
 # ─── Avatar preparation (in-process) ──────────────────────────
-prep_lock = threading.Lock()
+prep_lock = asyncio.Lock()
 
 
 def _prepare_avatar_material(video_path: str, avatar_id: str) -> None:
@@ -368,7 +369,6 @@ async def prepare_avatar(file: UploadFile = File(...)):
 async def health():
     return {"status": "ready" if avatar_cache else "loading", "device": str(device)}
 
-import asyncio
 inference_lock = asyncio.Lock()
 
 @app.post("/generate-video")
